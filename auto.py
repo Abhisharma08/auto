@@ -12,7 +12,7 @@ gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 # Configure Gemini
 genai.configure(api_key=gemini_api_key)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('googleai/gemini-2.0-flash')
 
 # Initialize Pyrogram Client
 app = Client("userbot_session", api_id=api_id, api_hash=api_hash)
@@ -31,7 +31,7 @@ def get_ai_response(prompt: str) -> str:
 
 # Delayed reply logic
 async def delayed_reply(client, message):
-    await asyncio.sleep(120)  # 2 minutes
+    await asyncio.sleep(30)  # 2 minutes
     reply_text = await asyncio.to_thread(get_ai_response, message.text)
     await message.reply_text(reply_text)
 
