@@ -4,66 +4,132 @@ import os
 import asyncio
 import google.generativeai as genai
 
-# Load environment variables
+# ------------ Config & Setup ------------
 load_dotenv()
-api_id = int(os.getenv("API_ID"))
-api_hash = os.getenv("API_HASH")
-gemini_api_key = os.getenv("GEMINI_API_KEY")
 
-# Configure Gemini
+try:
+    api_id = int(os.getenv("API_ID", "").strip())
+except ValueError:
+    api_id = None
+api_hash = (os.getenv("API_HASH") or "").strip()
+gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+
+if not api_id or not api_hash:
+    raise RuntimeError("API_ID/API_HASH missing or invalid in environment.")
+if not gemini_api_key:
+    raise RuntimeError("GEMINI_API_KEY missing in environment.")
+
 genai.configure(api_key=gemini_api_key)
-model = genai.GenerativeModel('googleai/gemini-2.0-flash')
 
-# Initialize Pyrogram Client
+# Use a valid Gemini model name
+# Common current names: "gemini-2.0-flash", "gemini-2.0-pro" (check your quota/enablement)
+model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+
+# Pyrogram session (userbot)
 app = Client("userbot_session", api_id=api_id, api_hash=api_hash)
 
-# Track status and pending tasks
+# ------------ State ------------
 is_away = False
-pending_tasks = {}
+pending_tasks: dict[int, asyncio.Task] = {}
+REPLY_DELAY_SECONDS = 120  # 2 minutes
 
-# Get AI response safely
+# ------------ Helpers ------------
+def extract_message_text(message) -> str:
+    # Prefer text, then caption; fallback if neither
+    if getattr(message, "text", None):
+        return message.text
+    if getattr(message, "caption", None):
+        return message.caption
+    return "Please summarise the content of the last message."
+
 def get_ai_response(prompt: str) -> str:
+    """
+    Runs in a thread via asyncio.to_thread (google.generativeai is sync).
+    Handles common None/empty edge cases.
+    """
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        resp = model.generate_content(prompt)
+        # resp.text is usually present, but guard anyway
+        text = getattr(resp, "text", None)
+        if text and text.strip():
+            return text.strip()
+        # Fallback: try candidates if text is empty
+        if hasattr(resp, "candidates") and resp.candidates:
+            # Try the first candidate’s text parts
+            for cand in resp.candidates:
+                parts = getattr(getattr(cand, "content", None), "parts", []) or []
+                for p in parts:
+                    t = getattr(p, "text", None)
+                    if t and t.strip():
+                        return t.strip()
+        return "Sorry, I couldn’t generate a response right now."
+    except Exception as e:
+        # Optional: log e
+        return "Sorry, I couldn’t generate a response right now."
+
+async def delayed_reply(client: Client, message):
+    chat_id = message.chat.id
+    try:
+        await asyncio.sleep(REPLY_DELAY_SECONDS)
+        prompt = extract_message_text(message)
+        reply_text = await asyncio.to_thread(get_ai_response, prompt)
+        await message.reply_text(reply_text, quote=True, disable_web_page_preview=True)
+    except asyncio.CancelledError:
+        # Task was cancelled because a newer message arrived; just exit cleanly
+        return
     except Exception:
-        return "Sorry, I couldn't generate a response right now."
+        # Avoid crashing the loop on unexpected errors
+        try:
+            await message.reply_text("⚠️ Failed to send an AI reply.", quote=True)
+        except Exception:
+            pass
+    finally:
+        # Clean up completed task
+        if pending_tasks.get(chat_id) is asyncio.current_task():
+            pending_tasks.pop(chat_id, None)
 
-# Delayed reply logic
-async def delayed_reply(client, message):
-    await asyncio.sleep(30)  # 2 minutes
-    reply_text = await asyncio.to_thread(get_ai_response, message.text)
-    await message.reply_text(reply_text)
+# ------------ Commands ------------
+# Note: set explicit prefixes in case your account uses something else
+CMD_PREFIXES = ["/", "!", "."]
 
-# Command: /away to set status
-@app.on_message(filters.me & filters.command("away"))
+@app.on_message(filters.me & filters.command("away", prefixes=CMD_PREFIXES))
 async def set_away(client, message):
     global is_away
     is_away = True
-    await message.reply("✅ Status set to *Away*. AI will auto-reply after 2 minutes.")
+    await message.reply_text(
+        f"✅ Status set to *Away*. I’ll auto-reply after {REPLY_DELAY_SECONDS//60} min.",
+        quote=True,
+    )
 
-# Command: /back to go online
-@app.on_message(filters.me & filters.command("back"))
+@app.on_message(filters.me & filters.command("back", prefixes=CMD_PREFIXES))
 async def set_back(client, message):
     global is_away
     is_away = False
-    await message.reply("🟢 Status set to *Available*. AI auto-replies are disabled.")
 
-# Auto-reply handler
+    # Cancel all pending delayed replies when you’re back
+    for task in list(pending_tasks.values()):
+        task.cancel()
+    pending_tasks.clear()
+
+    await message.reply_text("🟢 Status set to *Available*. Auto-replies disabled.", quote=True)
+
+# ------------ Auto-reply ------------
 @app.on_message(filters.private & ~filters.me)
 async def handle_message(client, message):
-    global is_away
     if not is_away:
-        return  # Do nothing if user is available
+        return  # Do nothing if available
 
     chat_id = message.chat.id
 
-    # Cancel any existing reply for this user
-    if chat_id in pending_tasks:
-        pending_tasks[chat_id].cancel()
+    # Cancel any existing scheduled reply for this chat (debounce)
+    old_task = pending_tasks.get(chat_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
 
-    # Schedule new reply
+    # Schedule a fresh delayed reply
     task = asyncio.create_task(delayed_reply(client, message))
     pending_tasks[chat_id] = task
 
+# ------------ Run ------------
 app.run()
+
