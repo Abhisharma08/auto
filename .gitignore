@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+
+# dotenv environment file
+.env
+
+# Pyrogram session files
+*.session
+*.session-journal
+
+# VS Code settings (optional)
+.vscode/
+
+# MacOS metadata (optional)
+.DS_Store
+
+# Logs (if any)
+*.log
